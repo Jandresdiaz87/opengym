@@ -1,0 +1,7 @@
+# This fork's Vercel deployment is Supabase-only: the static frontend in frontend/
+# talks to Supabase directly, no backend of its own. Without this, Vercel's
+# zero-config detection treats every .js file under the top-level api/ (the old
+# self-hosted Node server, kept in the repo for self-hosters who still want it —
+# see docker-compose.yml / .github/workflows/docker-publish.yml) as its own
+# Serverless Function, which blows past the Hobby plan's 12-function limit.
+api
