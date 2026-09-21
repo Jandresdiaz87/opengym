@@ -2,23 +2,34 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('../lib/api.js', () => ({ api: vi.fn() }))
+vi.mock('../lib/cloud-sync.js', async () => {
+  const { revsDiffer } = await import('../lib/state-categories.js')
+  return { fetchCloudState: vi.fn(), fetchCloudRev: vi.fn(), pushCloudState: vi.fn(), revsDiffer }
+})
+vi.mock('../lib/supabase.js', () => ({ getCurrentUser: vi.fn(), onAuthStateChange: vi.fn(), signOutSupabase: vi.fn() }))
+vi.mock('../lib/api.js', () => ({ setRemoteAuth: vi.fn() }))
 // pushState reaches the toast through a lazy import of useUI (which imports this store) — the
 // tests only need to see that it was asked, not a rendered toast.
 const { toast } = vi.hoisted(() => ({ toast: vi.fn() }))
 vi.mock('./useUI.js', () => ({ useUI: { getState: () => ({ toast }) } }))
 
-import { api } from '../lib/api.js'
+import { fetchCloudState, pushCloudState } from '../lib/cloud-sync.js'
 import { DEF, hasData, restoredStateFor, useStore } from './useStore.js'
 
 const clone = value => JSON.parse(JSON.stringify(value))
 const routine = id => ({ id, name: id, ex: [] })
 const workout = id => ({ id, d: '2026-09-01', entries: [] })
-const httpError = status => Object.assign(new Error('HTTP ' + status), { status })
+const revs = n => ({ routines: n, workouts: n, bodyweight: n, settings: n })
+// A brand-new Supabase profile: handle_new_user() gives every signup an (empty) profile_state
+// row the instant it's created, so "nothing here yet" is composeFromCategories({}) — the DEF
+// defaults, never a literal null the way the old file-backed server answered before its first
+// write. {} composed over DEF downstream is exactly that.
+const freshProfile = {}
+const puts = () => pushCloudState.mock.calls.map(([S, baseRev]) => ({ state: S, baseRev }))
 
 beforeEach(() => {
   localStorage.clear()
-  api.mockReset()
+  fetchCloudState.mockReset(); pushCloudState.mockReset()
   useStore.setState({ S: clone(DEF), user: null, ready: false })
 })
 
@@ -51,69 +62,55 @@ describe('saved workout state sync and restore', () => {
     const local = { ...clone(DEF), _ts: 10, routines: [routine('local')], active }
     const remote = { ...clone(DEF), _ts: 20, routines: [routine('remote')], active: null }
     useStore.setState({ S: local, user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValue({ state: remote })
+    fetchCloudState.mockResolvedValue({ state: remote, rev: revs(1) })
 
     await useStore.getState().pullState()
 
     expect(useStore.getState().S.routines.map(r => r.id)).toEqual(['remote'])
     expect(useStore.getState().S.active).toEqual(active)
     expect(JSON.parse(localStorage.getItem('gym_state_v1')).active).toEqual(active)
-    expect(api).toHaveBeenCalledTimes(1)
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
   })
 
   it('pushes local data instead of replacing it when the local state is newer', async () => {
     const local = { ...clone(DEF), _ts: 20, routines: [routine('local')] }
     const remote = { ...clone(DEF), _ts: 10, routines: [routine('remote')] }
     useStore.setState({ S: local, user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValueOnce({ state: remote }).mockResolvedValueOnce({})
+    fetchCloudState.mockResolvedValueOnce({ state: remote, rev: revs(1) })
+    pushCloudState.mockResolvedValueOnce({ rev: revs(2) })
 
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(2)
-    expect(api.mock.calls[1][0]).toBe('/api/data')
-    expect(JSON.parse(api.mock.calls[1][1].body).state.routines.map(r => r.id)).toEqual(['local'])
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
+    expect(puts()).toHaveLength(1)
+    expect(puts()[0].state.routines.map(r => r.id)).toEqual(['local'])
     expect(useStore.getState().S.routines.map(r => r.id)).toEqual(['local'])
   })
 
-  // A dirty copy is one the server has not seen yet — not one that outranks the server's. With a
-  // revision in the answer the two are merged and the merge is pushed against that revision.
+  // A dirty copy is one the server has not seen yet — not one that outranks the server's. It is
+  // merged with the server copy and the merge is pushed against the server's revision.
   it('merges a dirty local state with the server copy and pushes the merge', async () => {
-    const local = { ...clone(DEF), _ts: 10, routines: [routine('local')] }
-    const remote = { ...clone(DEF), _ts: 20, routines: [routine('remote')], _rev: 3 }
-    localStorage.setItem('gym_dirty', '1')
-    useStore.setState({ S: local, user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValueOnce({ state: remote, rev: 3 }).mockResolvedValueOnce({ ok: true, rev: 4 })
-
-    await useStore.getState().pullState()
-
-    expect(api).toHaveBeenCalledTimes(2)
-    const put = JSON.parse(api.mock.calls[1][1].body)
-    expect(put.baseRev).toBe(3)
-    expect(put.state.routines.map(r => r.id).sort()).toEqual(['local', 'remote'])
-    expect(useStore.getState().S.routines.map(r => r.id).sort()).toEqual(['local', 'remote'])
-    expect(localStorage.getItem('gym_dirty')).toBeNull()
-    expect(JSON.parse(localStorage.getItem('gym_sync'))).toEqual({ rev: 4, ts: useStore.getState().S._ts })
-  })
-
-  // A server from before revisions answers without one; then the old rule holds and the dirty
-  // copy is pushed as it is.
-  it('pushes a dirty local state as-is to a server without revisions', async () => {
     const local = { ...clone(DEF), _ts: 10, routines: [routine('local')] }
     const remote = { ...clone(DEF), _ts: 20, routines: [routine('remote')] }
     localStorage.setItem('gym_dirty', '1')
     useStore.setState({ S: local, user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValueOnce({ state: remote }).mockResolvedValueOnce({})
+    fetchCloudState.mockResolvedValueOnce({ state: remote, rev: revs(3) })
+    pushCloudState.mockResolvedValueOnce({ rev: revs(4) })
 
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(2)
-    expect(JSON.parse(api.mock.calls[1][1].body).state.routines.map(r => r.id)).toEqual(['local'])
-    expect(useStore.getState().S.routines.map(r => r.id)).toEqual(['local'])
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
+    expect(puts()).toHaveLength(1)
+    expect(puts()[0].baseRev).toEqual(revs(3))
+    expect(puts()[0].state.routines.map(r => r.id).sort()).toEqual(['local', 'remote'])
+    expect(useStore.getState().S.routines.map(r => r.id).sort()).toEqual(['local', 'remote'])
+    expect(localStorage.getItem('gym_dirty')).toBeNull()
+    expect(JSON.parse(localStorage.getItem('gym_sync'))).toEqual({ revs: revs(4), ts: useStore.getState().S._ts })
   })
 
   it('restores a remote state over defaults when the local profile is empty', async () => {
     const remote = { _ts: 30, routines: [routine('remote')], workouts: [] }
-    api.mockResolvedValue({ state: remote })
+    fetchCloudState.mockResolvedValue({ state: remote, rev: revs(1) })
 
     await useStore.getState().pullState()
 
@@ -125,18 +122,18 @@ describe('saved workout state sync and restore', () => {
   it('keeps the local saved state when the restore request fails', async () => {
     const local = { ...clone(DEF), _ts: 10, routines: [routine('local')] }
     useStore.setState({ S: local, user: { id: 'user-1' }, ready: true })
-    api.mockRejectedValue(new Error('offline'))
+    fetchCloudState.mockRejectedValue(new Error('offline'))
 
     await useStore.getState().pullState()
 
     expect(useStore.getState().S.routines.map(r => r.id)).toEqual(['local'])
-    expect(api).toHaveBeenCalledTimes(1)
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
   })
 
   it('an adopted server state keeps the timestamp it came with', async () => {
     const remote = { ...clone(DEF), _ts: 20, routines: [routine('remote')] }
     useStore.setState({ S: clone(DEF), user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValue({ state: remote })
+    fetchCloudState.mockResolvedValue({ state: remote, rev: revs(1) })
 
     await useStore.getState().pullState()
 
@@ -149,22 +146,23 @@ describe('saved workout state sync and restore', () => {
   // A's next reload would see the server (T1) as older and push its stale copy over B's workout.
   it('an unchanged adopted copy does not push over a newer change from another device', async () => {
     useStore.setState({ S: clone(DEF), user: { id: 'user-1' }, ready: true })
-    api.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 1000000, workouts: [workout('w1')] } })
+    fetchCloudState.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 1000000, workouts: [workout('w1')] }, rev: revs(1) })
     await useStore.getState().pullState()
     expect(useStore.getState().S.workouts.map(w => w.id)).toEqual(['w1'])
 
-    api.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 1010000, workouts: [workout('w1'), workout('w2-from-B')] } })
+    fetchCloudState.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 1010000, workouts: [workout('w1'), workout('w2-from-B')] }, rev: revs(2) })
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(2)
-    expect(api.mock.calls.every(([, opts]) => !opts)).toBe(true)   // two GETs, no PUT
+    expect(fetchCloudState).toHaveBeenCalledTimes(2)
+    expect(pushCloudState).not.toHaveBeenCalled()
     expect(useStore.getState().S.workouts.map(w => w.id)).toEqual(['w1', 'w2-from-B'])
     expect(useStore.getState().S._ts).toBe(1010000)
   })
 })
 
 // The saved copy is owned by whoever last signed in on this device. An expired or revoked session
-// only drops the user (boot's 401 path), so the data is still here when the next profile signs in.
+// only drops the user (boot's no-session path), so the data is still here when the next profile
+// signs in.
 describe('signing in as a different profile', () => {
   const active = { id: 'A-active', d: '2026-09-01', routineId: 'A', name: 'A', entries: [] }
   const signInAsAThenExpire = () => {
@@ -176,12 +174,13 @@ describe('signing in as a different profile', () => {
 
   it('does not move the previous profile data into a brand-new account', async () => {
     signInAsAThenExpire()
-    api.mockResolvedValue({ state: null })
+    fetchCloudState.mockResolvedValue({ state: freshProfile, rev: revs(0) })
 
     useStore.getState().setUser({ id: 'B', name: 'B' })
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(1)   // the GET only — nothing was pushed under B
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
+    expect(pushCloudState).not.toHaveBeenCalled()   // nothing was pushed under B
     expect(useStore.getState().S.routines).toEqual([])
     expect(useStore.getState().S.bodyweight).toEqual([])
     expect(useStore.getState().S.active).toBeNull()
@@ -191,14 +190,14 @@ describe('signing in as a different profile', () => {
 
   it('adopts the new profile own state even when it is older or a push failed after expiry', async () => {
     signInAsAThenExpire()
-    localStorage.setItem('gym_dirty', '1')   // a debounced push that hit the 401
+    localStorage.setItem('gym_dirty', '1')   // a debounced push that hit "not signed in"
     const remoteB = { ...clone(DEF), _ts: 10, routines: [routine('B-routine')], active: null }
-    api.mockResolvedValue({ state: remoteB })
+    fetchCloudState.mockResolvedValue({ state: remoteB, rev: revs(1) })
 
     useStore.getState().setUser({ id: 'B', name: 'B' })
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(1)
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
     expect(useStore.getState().S.routines.map(r => r.id)).toEqual(['B-routine'])
     expect(useStore.getState().S.active).toBeNull()   // A's in-progress workout is not carried over
     expect(localStorage.getItem('gym_dirty')).toBeNull()
@@ -206,13 +205,15 @@ describe('signing in as a different profile', () => {
 
   it('the same profile signing in again keeps and pushes its newer local copy', async () => {
     signInAsAThenExpire()
-    api.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 10, routines: [routine('remote')] } }).mockResolvedValueOnce({})
+    fetchCloudState.mockResolvedValueOnce({ state: { ...clone(DEF), _ts: 10, routines: [routine('remote')] }, rev: revs(1) })
+    pushCloudState.mockResolvedValueOnce({ rev: revs(2) })
 
     useStore.getState().setUser({ id: 'A', name: 'A' })
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(2)
-    expect(JSON.parse(api.mock.calls[1][1].body).state.routines.map(r => r.id)).toEqual(['A-routine'])
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)
+    expect(puts()).toHaveLength(1)
+    expect(puts()[0].state.routines.map(r => r.id)).toEqual(['A-routine'])
     expect(useStore.getState().S.active).toEqual(active)
   })
 
@@ -222,8 +223,9 @@ describe('signing in as a different profile', () => {
     vi.useFakeTimers()
     try {
       useStore.getState().setUser({ id: 'A', name: 'A' })
+      useStore.setState({ ready: true })   // boot has finished in this tab — arms a real debounce timer below, not pushPending
       useStore.getState().replaceState({ ...clone(DEF), _ts: 20, routines: [routine('A-routine')], active }, true)   // arms a push
-      api.mockResolvedValue({})
+      pushCloudState.mockResolvedValue({ rev: revs(1) })
 
       // B's setUser in the other tab: it wiped the copy, wrote defaults, then recorded the owner.
       // B's own data only lands there after its pull — this tab never re-reads it.
@@ -235,12 +237,12 @@ describe('signing in as a different profile', () => {
       expect(hasData(useStore.getState().S)).toBe(false)
       expect(useStore.getState().S.active).toBeNull()
 
-      vi.advanceTimersByTime(3000)   // the push armed under A must not fire under B's cookie
+      vi.advanceTimersByTime(3000)   // the push armed under A must not fire under B's session
       useStore.getState().update(s => { s.routines.push(routine('typed-after')) })
       vi.advanceTimersByTime(3000)
       await useStore.getState().pushState()
 
-      expect(api).not.toHaveBeenCalled()
+      expect(pushCloudState).not.toHaveBeenCalled()
       expect(JSON.parse(localStorage.getItem('gym_state_v1')).routines.map(r => r.id)).toEqual(['typed-after'])
     } finally { vi.useRealTimers() }
   })
@@ -250,7 +252,7 @@ describe('signing in as a different profile', () => {
   it('a tab still holding the previous profile drops its data when that profile signs out elsewhere', async () => {
     useStore.getState().setUser({ id: 'A', name: 'A' })
     useStore.getState().replaceState({ ...clone(DEF), _ts: 20, routines: [routine('A-routine')], bodyweight: [{ d: '2026-09-01', kg: 80 }], active })
-    api.mockResolvedValue({ state: null })
+    fetchCloudState.mockResolvedValue({ state: freshProfile, rev: revs(0) })
 
     localStorage.removeItem('gym_owner')   // gym_state_v1 still holds A's copy at this instant
     window.dispatchEvent(new StorageEvent('storage', { key: 'gym_owner', oldValue: 'A', newValue: null }))
@@ -262,8 +264,8 @@ describe('signing in as a different profile', () => {
     useStore.getState().setUser({ id: 'C', name: 'C' })
     await useStore.getState().pullState()
 
-    expect(api).toHaveBeenCalledTimes(1)   // the GET only — nothing of A's was pushed under C
-    expect(api.mock.calls[0][1]).toBeUndefined()
+    expect(fetchCloudState).toHaveBeenCalledTimes(1)   // nothing of A's was pushed under C
+    expect(pushCloudState).not.toHaveBeenCalled()
     expect(hasData(useStore.getState().S)).toBe(false)
   })
 
@@ -272,7 +274,7 @@ describe('signing in as a different profile', () => {
   it('signing out removes the owner only after the wiped copy is written', async () => {
     useStore.getState().setUser({ id: 'A', name: 'A' })
     useStore.getState().replaceState({ ...clone(DEF), _ts: 20, routines: [routine('A-routine')] })
-    api.mockResolvedValue({})
+    pushCloudState.mockResolvedValue({ rev: revs(1) })
 
     const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
     const real = globalThis.localStorage
@@ -308,50 +310,19 @@ describe('signing in as a different profile', () => {
   })
 
   it('guest data built after a sign-out still moves into a newly created profile', async () => {
-    api.mockResolvedValue({})
+    pushCloudState.mockResolvedValue({ rev: revs(1) })
     useStore.getState().setUser({ id: 'A', name: 'A' })
     await useStore.getState().signOut()
     expect(localStorage.getItem('gym_owner')).toBeNull()
     expect(hasData(useStore.getState().S)).toBe(false)
 
     useStore.getState().update(s => { s.routines.push(routine('guest')) }, false)
-    api.mockClear()
+    pushCloudState.mockClear()
     useStore.getState().setUser({ id: 'B', name: 'B' })
-    expect(hasData(useStore.getState().S)).toBe(true)   // what the register sheet checks before pushing
+    expect(hasData(useStore.getState().S)).toBe(true)   // what the sign-up flow checks before pushing
     await useStore.getState().pushState()
 
-    expect(api).toHaveBeenCalledTimes(1)
-    expect(api.mock.calls[0][1].method).toBe('PUT')
-    expect(JSON.parse(api.mock.calls[0][1].body).state.routines.map(r => r.id)).toEqual(['guest'])
-  })
-})
-
-describe('push failures', () => {
-  it('says once that the server refused the upload as too large, and keeps the copy dirty', async () => {
-    useStore.setState({ S: { ...clone(DEF), routines: [routine('local')] }, user: { id: 'user-1' }, ready: true })
-
-    api.mockRejectedValueOnce(httpError(401))
-    await useStore.getState().pushState()
-    expect(localStorage.getItem('gym_dirty')).toBe('1')
-    expect(toast).not.toHaveBeenCalled()
-
-    api.mockRejectedValueOnce(httpError(413))
-    await useStore.getState().pushState()
-    await vi.waitFor(() => expect(toast).toHaveBeenCalledTimes(1))
-    expect(toast.mock.calls[0][0]).toMatch(/too large/)
-    expect(localStorage.getItem('gym_dirty')).toBe('1')
-
-    api.mockRejectedValueOnce(httpError(413))
-    await useStore.getState().pushState()
-    await new Promise(r => setTimeout(r, 0))
-    expect(toast).toHaveBeenCalledTimes(1)
-
-    // A push that goes through ends the streak: the next refusal is news again.
-    api.mockResolvedValueOnce({})
-    await useStore.getState().pushState()
-    expect(localStorage.getItem('gym_dirty')).toBeNull()
-    api.mockRejectedValueOnce(httpError(413))
-    await useStore.getState().pushState()
-    await vi.waitFor(() => expect(toast).toHaveBeenCalledTimes(2))
+    expect(puts()).toHaveLength(1)
+    expect(puts()[0].state.routines.map(r => r.id)).toEqual(['guest'])
   })
 })

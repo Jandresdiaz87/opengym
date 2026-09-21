@@ -1,5 +1,7 @@
 import { create } from 'zustand'
-import { api, setRemoteAuth } from '../lib/api.js'
+import { setRemoteAuth } from '../lib/api.js'
+import { fetchCloudState, fetchCloudRev, pushCloudState, revsDiffer } from '../lib/cloud-sync.js'
+import { getCurrentUser, onAuthStateChange, signOutSupabase } from '../lib/supabase.js'
 import { localTZ } from '../lib/format.js'
 import { t } from '../lib/i18n.js'
 import { registerCustom } from '../lib/exercises.js'
@@ -13,10 +15,12 @@ import { loadCoachDevice, saveCoachDevice, coachDeviceSettings } from '../lib/co
 import { WC_DEFAULT } from '../lib/workout-controls.js'
 
 const KEY = 'gym_state_v1'
-// Where this device stands with the server: the revision it last adopted or pushed, and its own
-// `_ts` at that moment. `rev` goes back to the server as `baseRev` on every push, so a write over
-// a document this device never saw is refused (409) instead of dropping another device's work;
-// `ts` tells a pull whether anything changed here since. See pushState/pullState.
+// Where this device stands with the server: the revision it last adopted or pushed — one per
+// category (routines/workouts/bodyweight/settings, see state-categories.js) — and its own `_ts`
+// at that moment. `revs` goes back to Supabase as `baseRev` on every push, so a write over a
+// column this device never saw is refused (per category, not the whole document) instead of
+// dropping another device's work; `ts` tells a pull whether anything changed here since. See
+// pushState/pullState.
 const SYNC_KEY = 'gym_sync'
 const CHECK_MIN_MS = 3000    // rev checks closer together than this are the same event (focus + visibility)
 const POLL_MS = 30000        // while the app is open and signed in, ask the server for its revision this often
@@ -105,7 +109,6 @@ export function restoredStateFor(local, remote, dirty = false) {
 export const useStore = create((set, get) => {
   let pushTm = null
   let saveTm = null
-  let toldTooLarge = false
   let pushing = null       // the PUT in flight, so a second push waits for it instead of racing it
   let pushAgain = false    // a push asked for while one was in flight — run once more after it
   let pulling = null       // the GET in flight, so two resume signals make one request
@@ -116,7 +119,9 @@ export const useStore = create((set, get) => {
   let offlineChanges = false   // a push failed for lack of network — the next one that lands says so
 
   const readSync = () => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || null } catch { return null } }
-  const writeSync = (rev, ts) => localStorage.setItem(SYNC_KEY, JSON.stringify({ rev, ts: ts || 0 }))
+  // `revs` is the four-category object from cloud-sync.js ({ routines, workouts, bodyweight,
+  // settings }), never a single number now — every call site below passes that object through.
+  const writeSync = (revs, ts) => localStorage.setItem(SYNC_KEY, JSON.stringify({ revs, ts: ts || 0 }))
   // What the banner shows a signed-in user: `offline` when the server could not be reached at
   // all, `pending` while a change is still owed to it (either way, or a push the server refused).
   const setSync = patch => {
@@ -177,13 +182,13 @@ export const useStore = create((set, get) => {
     const owed = localStorage.getItem('gym_dirty') === '1' || pushTm !== null || pushPending
     if (!sync || owed) return get().pullState()
     try {
-      const { rev } = await api('/api/data/rev')
+      const rev = await fetchCloudRev()
       setSync({ offline: false })
-      if (rev !== sync.rev) return get().pullState()
+      if (revsDiffer(rev, sync.revs)) return get().pullState()
     } catch (e) {
       if (e.status === 401) return
       if (isNetworkError(e)) setSync({ offline: true })
-      else return get().pullState()   // a server that lacks the route (older API) — the full pull knows the old protocol
+      else return get().pullState()
     }
   }
   const schedulePoll = () => {
@@ -202,30 +207,24 @@ export const useStore = create((set, get) => {
   // conditional on exactly the document that was merged. The merged copy is stamped — it is a
   // real change this device now holds — while `ts` in the marker stays old, so a pull that
   // happens before the push lands still sees it as unsent.
-  const mergeInto = (local, remote, rev) => {
+  const mergeInto = (local, remote, revs) => {
     const merged = Object.assign(clone(DEF), mergeStates(local, remote))
     merged.active = local.active || null
     persist(merged, false)
-    writeSync(rev, readSync()?.ts || 0)
+    writeSync(revs, readSync()?.ts || 0)
   }
   // Take the server's copy as this device's own, timestamp and all (see persist).
-  const adopt = (next, rev) => { persist(next, false, false); writeSync(rev, next._ts) }
+  const adopt = (next, revs) => { persist(next, false, false); writeSync(revs, next._ts) }
 
   const doPush = async (attempt = 0) => {
     const S = get().S
     const sync = readSync()
     const force = forceNext
-    const body = { state: S }
-    if (!force && sync) body.baseRev = sync.rev
     try {
-      const r = await api('/api/data', { method: 'PUT', body: JSON.stringify(body) })
+      const r = await pushCloudState(S, force ? null : sync?.revs)
       if (force) forceNext = false
-      // A server from before revisions answers without one — then there is nothing to hold the
-      // next push to, and the marker must not pretend otherwise.
-      if (r.rev == null) localStorage.removeItem(SYNC_KEY)
-      else writeSync(r.rev, S._ts)
+      writeSync(r.rev, S._ts)
       localStorage.removeItem('gym_dirty')
-      toldTooLarge = false
       // Back from offline with changes that were waiting: say so once — the banner that promised
       // "syncs when you're back online" has just kept its word.
       setSync({ offline: false, pending: false, lastSynced: Date.now() })
@@ -234,28 +233,19 @@ export const useStore = create((set, get) => {
         import('./useUI.js').then(({ useUI }) => useUI.getState().toast(t('Back online — synced with the server.'))).catch(() => {})
       }
     } catch (e) {
-      // A session that is gone is boot's business (/api/me); the copy stays owed to the server.
+      // A session that is gone is boot's business (getCurrentUser); the copy stays owed to Supabase.
       if (e.status === 401) { localStorage.setItem('gym_dirty', '1'); return }
       if (isNetworkError(e)) { localStorage.setItem('gym_dirty', '1'); offlineChanges = true; setSync({ offline: true, pending: true }); return }
       if (e.status === 409 && e.data && attempt < 2) {
-        // Another device wrote since this one last read. The server sent its document along;
-        // merge and push once more against that revision. A second refusal in a row leaves the
-        // copy dirty and the next resume pull takes it from there.
-        mergeInto(get().S, e.data.state, e.data.rev || 0)
+        // Another device wrote since this one last read (on at least one category — see
+        // pushCloudState). The server sent its current document along; merge and push once more
+        // against that revision. A second refusal in a row leaves the copy dirty and the next
+        // resume pull takes it from there.
+        mergeInto(get().S, e.data.state, e.data.rev || null)
         return doPush(attempt + 1)
       }
       localStorage.setItem('gym_dirty', '1')
       setSync({ offline: false, pending: true })
-      // A 413 comes from the proxy in front of the API (nginx: client_max_body_size), which
-      // caps the request body. Every later push is at least as big, so nothing reaches the
-      // server until the limit is raised — said once per refusal streak; gym_dirty keeps the
-      // retries going. useUI imports this store, hence the lazy import.
-      if (e.status === 413 && !toldTooLarge) {
-        toldTooLarge = true
-        import('./useUI.js')
-          .then(({ useUI }) => useUI.getState().toast(t('Sync failed: the server refused the upload as too large. Your changes have not reached the server.')))
-          .catch(() => {})
-      }
     }
   }
 
@@ -307,17 +297,24 @@ export const useStore = create((set, get) => {
     localStorage.removeItem('gym_owner')
   }
 
+  // Supabase's own cross-tab/cross-device auth events — a token revoked elsewhere ("sign out
+  // everywhere" reaching THIS tab), a session ending on its own, or a sign-in completing after
+  // the Google OAuth redirect comes back. Ignored until boot() has run once: boot's own
+  // getCurrentUser() call is what handles the very first read, and firing this before `ready`
+  // would race it.
+  onAuthStateChange(user => {
+    if (!get().ready) return
+    const cur = get().user
+    if (!user) { if (cur) clearLocalSession(); return }
+    if (!cur || cur.id !== user.id) { get().setUser(user); get().pullState() }
+  })
+
   return {
     S: (() => { const s = loadState(); registerCustom(s.customEx); return s })(),
     user: (() => { try { return JSON.parse(localStorage.getItem('gym_user')) || null } catch { return null } })(),
     ready: false,
     // Server sync as the banner sees it (components/SyncBanner.jsx). Only meaningful signed in.
     sync: { offline: false, pending: localStorage.getItem('gym_dirty') === '1', lastSynced: 0 },
-    /* Instance capabilities from GET /api/config. `config.coach` is present only when the owner
-       has both enabled the Coach and connected a provider — every Coach entry point in the app
-       hangs off it via coachAvailable(), so an unconfigured instance renders exactly what it
-       always did, and a configured one is the only place any of it appears. */
-    config: null,
     needsMobileOnboarding: false,   // mobile build only — set true by boot() on a genuine first launch
     // Mobile build only: how the Coach runs on this phone — { mode: 'off'|'server'|'byok',
     // provider, model, baseUrl } from lib/coach-device.js. Never the key, never a proposal.
@@ -347,20 +344,14 @@ export const useStore = create((set, get) => {
     isGuest: () => localStorage.getItem('gym_guest') === '1',
     setGuest(v) { if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest'); set({}) },
 
-    // Public config from /api/config (invite_only, allow_guest). null until the first successful
-    // fetch — the login screen and boot both read it, so it is fetched once and cached here
-    // rather than by each screen that happens to need it.
-    config: null,
-    async loadConfig() {
-      if (get().config) return get().config
-      return get().refreshConfig()
-    },
-    // Always asks. The cached copy is right for one boot, but an admin can switch the Coach on
-    // while a paired phone sits on the setup screen — that screen wants today's answer.
-    async refreshConfig() {
-      try { const c = await api('/api/config'); set({ config: c }); return c }
-      catch { return null }
-    },
+    // Was fetched from the old self-hosted server's /api/config (invite_only, allow_guest,
+    // Coach availability) — there is no instance-level config server any more, so this is a
+    // fixed value rather than a network call. Guest mode is purely a local/frontend feature now
+    // (no server-side gate on it, unlike the old ALLOW_GUEST env var); invite-only signup isn't
+    // built yet (out of scope for this pass — flagged as a follow-up, see project notes).
+    config: { invite_only: false, allow_guest: true },
+    async loadConfig() { return get().config },
+    async refreshConfig() { return get().config },
 
     setUser(u) {
       if (u) {
@@ -405,7 +396,7 @@ export const useStore = create((set, get) => {
         try {
           if (pushTm) { clearTimeout(pushTm); pushTm = null; await get().pushState() }
           else if (pushing) await pushing
-          const res = await api('/api/data')
+          const res = await fetchCloudState()
           lastCheck = Date.now()
           setSync({ offline: false })
           const { state, rev } = res
@@ -413,7 +404,8 @@ export const useStore = create((set, get) => {
           // Owed to the server: a push that failed, or a change made while boot was still pulling.
           const dirty = localStorage.getItem('gym_dirty') === '1' || pushPending
           const sync = readSync()
-          // A server from before revisions: the old rule, newer `_ts` wins outright.
+          // The row genuinely doesn't exist (shouldn't happen — the signup trigger creates it):
+          // fall back to the old newer-`_ts`-wins rule with nothing to hold a push to.
           if (rev == null) {
             localStorage.removeItem(SYNC_KEY)
             const restored = restoredStateFor(S, state, dirty)
@@ -421,9 +413,9 @@ export const useStore = create((set, get) => {
             else if (hasData(S)) await get().pushState()
             return
           }
-          // No marker yet — first pull on this device, or a client that just learned about
-          // revisions. The newer copy wins as before, except that a copy still owed to the
-          // server (dirty) is merged instead of pushed over whatever is there.
+          // No marker yet — first pull on this device. The newer copy wins as before, except
+          // that a copy still owed to the server (dirty) is merged instead of pushed over
+          // whatever is there.
           if (!sync) {
             if (dirty && state) { mergeInto(S, state, rev); pushPending = false; await get().pushState(); return }
             const restored = restoredStateFor(S, state, false)
@@ -432,7 +424,7 @@ export const useStore = create((set, get) => {
             else writeSync(rev, state?._ts || 0)
             return
           }
-          const serverMoved = rev !== sync.rev
+          const serverMoved = revsDiffer(rev, sync.revs)
           const localChanged = dirty || (S._ts || 0) > (sync.ts || 0)
           if (!serverMoved) { if (localChanged) await get().pushState(); return }
           if (!state) { writeSync(rev, 0); if (hasData(S)) await get().pushState(); return }
@@ -454,7 +446,7 @@ export const useStore = create((set, get) => {
     // device's data, as creating a profile always did.
     async adoptProfile(ask) {
       if (pulling) await pulling
-      const res = await api('/api/data')   // a failure here is the caller's toast: sign-in needed the server anyway
+      const res = await fetchCloudState()   // a failure here is the caller's toast: sign-in needed Supabase anyway
       const { state, rev } = res
       const S = get().S
       setSync({ offline: false })
@@ -484,7 +476,7 @@ export const useStore = create((set, get) => {
     },
 
     async signOut() {
-      try { await get().pushState(); await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { /* */ }
+      try { await get().pushState(); await signOutSupabase(false) } catch (e) { /* */ }
       clearLocalSession()
     },
 
@@ -514,14 +506,14 @@ export const useStore = create((set, get) => {
       set({ ready: true })
     },
 
-    // "Sign out everywhere": the server bumps this profile's session version, which kills every
-    // session it has on any device — this browser included, so the app has to end up exactly
+    // "Sign out everywhere": scope:'global' revokes every refresh token Supabase Auth has ever
+    // issued this user, on any device — this browser included, so the app has to end up exactly
     // where a normal signOut leaves it. Unlike signOut the request is NOT swallowed: if it fails
     // the sessions elsewhere are all still valid, and wiping this device's copy of the data
-    // would sign the user out of the one place the bump didn't reach. Caller reports the error.
+    // would sign the user out of the one place the revocation didn't reach. Caller reports the error.
     async signOutAll() {
       await get().pushState()   // never throws — stores gym_dirty and moves on when offline
-      await api('/api/logout/all', { method: 'POST', body: '{}' })
+      await signOutSupabase(true)
       clearLocalSession()
     },
 
@@ -592,20 +584,23 @@ export const useStore = create((set, get) => {
       const cfg = await get().loadConfig()
       if (!guestAllowed(cfg)) get().setGuest(false)
       try {
-        const me = await api('/api/me')
-        get().setUser(me.user)
-        await get().pullState()
-        // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
-        // without needing to revisit Settings.
-        const tz = localTZ()
-        if (get().S.reminder?.on && get().S.reminder.tz !== tz) {
-          get().update(s => { s.reminder = { ...s.reminder, tz } })
+        const user = await getCurrentUser()
+        if (user) {
+          get().setUser(user)
+          await get().pullState()
+          // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
+          // without needing to revisit Settings.
+          const tz = localTZ()
+          if (get().S.reminder?.on && get().S.reminder.tz !== tz) {
+            get().update(s => { s.reminder = { ...s.reminder, tz } })
+          }
+        } else {
+          get().setUser(null)
         }
       } catch (e) {
-        if (e.status === 401) get().setUser(null)
         // Started without a network (a home-screen app reopened in the gym's basement): keep the
         // signed-in copy and say so from the first screen, not only after the first failed push.
-        else if (isNetworkError(e) && get().user) setSync({ offline: true })
+        if (get().user) setSync({ offline: true })
       }
       finishBoot()
     }

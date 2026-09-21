@@ -556,18 +556,18 @@ describe('the gate has something real to read', () => {
     // depend on, so every Coach surface silently vanished on every instance: no entry point, and
     // /#/coach redirecting straight back to /home. A missing key must fail here, not in a browser.
     // Asserted against the source rather than the live store: useStore touches `document` at
-    // import time, so it cannot be instantiated in this environment. Crude, but it fails on
-    // exactly the two edits that broke it — dropping the field, or dropping the fetch.
-    // Matched loosely on purpose: boot() fetches through loadConfig() rather than inlining the
-    // call, so what matters is that the field exists and that something writes /api/config
-    // into it — not the spelling of the expression that does it.
+    // import time, so it cannot be instantiated in this environment.
+    //
+    // Since the Supabase migration this checks something narrower than it used to: `config` no
+    // longer comes from a network fetch (there is no instance server left to ask), so it's a
+    // fixed value rather than something loadConfig() populates from /api/config — and `coach` is
+    // deliberately absent from that value, which is what keeps every Coach entry point hidden
+    // until a future pass migrates the feature. What still matters here is only that the field
+    // exists at all and is never undefined, so coachAvailable() has something real to read.
     const { readFileSync } = await import('node:fs')
     const src = readFileSync(new URL('../store/useStore.js', import.meta.url), 'utf8')
-    expect(src).toMatch(/\bconfig:\s*null\b/)
-    expect(src).toMatch(/set\(\s*\{\s*config[:\s]/)
-    expect(src).toMatch(/api\(['"]\/api\/config['"]\)/)
-    // and boot() must actually reach it, however it is spelled
-    expect(src).toMatch(/loadConfig\(\)|config:\s*await api\(/)
+    expect(src).toMatch(/\bconfig:\s*\{[^}]*\}/)
+    expect(src).not.toMatch(/\bconfig:\s*(null|undefined)\b/)
   })
 
   it('a configured instance with a signed-in user opens the gate', () => {

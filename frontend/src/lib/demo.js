@@ -11,4 +11,6 @@
 // lands in a self-hosted bundle.
 export const DEMO = import.meta.env.VITE_DEMO === '1'
 export const DEMO_SEEDED = 'gym_demo_seeded_v1'
-export const REPO = 'https://gitlab.com/DuarteSantos8/opengym'
+// This fork's own repo — AGPL §13 requires that anyone using this instance over the network
+// can get the corresponding source of what's actually running, not the unmodified upstream.
+export const REPO = 'https://github.com/Jandresdiaz87/opengym'
