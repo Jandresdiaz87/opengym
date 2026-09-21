@@ -277,6 +277,17 @@ export const useStore = create((set, get) => {
   // no owner (a sign-out) this tab falls back to defaults rather than read the key at all — the
   // previous profile's data must not stay here whichever key's event lands first.
   window.addEventListener('storage', e => {
+    if (e.key === SYNC_KEY) {
+      // Another tab of the same profile just moved the shared revision marker. This tab's own
+      // copy of `sync` (read fresh from storage on the next check) would then already match the
+      // server, so checkRev's cheap rev-comparison would wrongly conclude nothing changed and
+      // never pull — leaving this tab's view stale, and worse, a later edit here would push under
+      // that already-advanced baseRev and silently overwrite the other tab's write. Pull for
+      // real; pullState() itself decides whether to adopt or merge based on this tab's own
+      // unsynced changes, so it's safe even if this tab has edits in flight.
+      if (get().user && get().ready) get().pullState(true)
+      return
+    }
     if (e.key !== 'gym_owner') return
     const user = get().user
     if (!user || e.newValue === user.id) return
@@ -390,7 +401,7 @@ export const useStore = create((set, get) => {
     // Ask the server for its copy and settle the difference. Coalesced, and a push still waiting
     // in the debounce goes first — the server's answer is then the one that already includes it,
     // and the push itself is what catches a conflict.
-    async pullState() {
+    async pullState(forceMoved = false) {
       if (pulling) return pulling
       pulling = (async () => {
         try {
@@ -424,7 +435,13 @@ export const useStore = create((set, get) => {
             else writeSync(rev, state?._ts || 0)
             return
           }
-          const serverMoved = revsDiffer(rev, sync.revs)
+          // `sync` is re-read fresh from the shared localStorage marker, which another tab's own
+          // write can already have advanced past what this tab's in-memory S reflects — so a
+          // rev-diff against it can read as "unchanged" even though this pull was triggered
+          // precisely because something changed. `forceMoved` (from the cross-tab storage
+          // listener below) skips that stale comparison and goes straight to reconciling this
+          // tab's actual content against what was just fetched.
+          const serverMoved = forceMoved || revsDiffer(rev, sync.revs)
           const localChanged = dirty || (S._ts || 0) > (sync.ts || 0)
           if (!serverMoved) { if (localChanged) await get().pushState(); return }
           if (!state) { writeSync(rev, 0); if (hasData(S)) await get().pushState(); return }
