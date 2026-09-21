@@ -10,7 +10,6 @@ import { guestAllowed } from '../lib/guest.js'
 import { MOBILE, initReminderSync, nativeLoad, nativeSave, onAppActive, syncReminder, writeAutoBackup } from '../lib/mobile.js'
 import { mergeStates, localExtras } from '../lib/sync-merge.js'
 import { loadRemote, chooseLocal, forgetRemote, connect } from '../lib/remote.js'
-import { loadCoachDevice, saveCoachDevice, coachDeviceSettings } from '../lib/coach-device.js'
 
 import { WC_DEFAULT } from '../lib/workout-controls.js'
 
@@ -327,12 +326,6 @@ export const useStore = create((set, get) => {
     // Server sync as the banner sees it (components/SyncBanner.jsx). Only meaningful signed in.
     sync: { offline: false, pending: localStorage.getItem('gym_dirty') === '1', lastSynced: 0 },
     needsMobileOnboarding: false,   // mobile build only — set true by boot() on a genuine first launch
-    // Mobile build only: how the Coach runs on this phone — { mode: 'off'|'server'|'byok',
-    // provider, model, baseUrl } from lib/coach-device.js. Never the key, never a proposal.
-    coachLocal: null,
-    async setCoachLocal(patch) {
-      set({ coachLocal: coachDeviceSettings(await saveCoachDevice(patch)) })
-    },
 
     // Mutate a draft of S via producer fn, then persist + schedule sync.
     update(mut, push = true) {
@@ -550,7 +543,6 @@ export const useStore = create((set, get) => {
       // case it behaves exactly like the signed-in web flow below, straight from here.
       if (MOBILE) {
         const remote = await loadRemote()
-        set({ coachLocal: coachDeviceSettings(await loadCoachDevice()) })
         if (remote?.mode === 'remote') {
           setRemoteAuth(remote.base, remote.token)
           try {

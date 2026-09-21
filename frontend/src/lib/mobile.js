@@ -55,7 +55,7 @@ export async function nativeSave(state) {
 const REMOTE_FILE = 'opengym-remote.json'
 
 // Small JSON files in the app's private data directory, for device facts that must not ride
-// in S (which syncs and exports): the pairing, and how the Coach runs on this phone.
+// in S (which syncs and exports): the pairing.
 export async function readJsonFile(name) {
   try {
     const { Filesystem, Directory, Encoding } = await import('@capacitor/filesystem')
